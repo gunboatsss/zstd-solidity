@@ -1309,7 +1309,7 @@ library ZstdDecompress {
                 }
 
                 let hufTable := mload(0x40)
-                mstore(0x40, add(hufTable, 4096))
+                mstore(0x40, add(hufTable, 131072))
                 hufBuildDTableFromWeights(hufTable, weights, numSyms)
 
                 let litSrc := add(src, hdrBytesConsumed)
@@ -1384,7 +1384,7 @@ function hufBuildDTableFromWeights(dt, weights, numSyms) {
                         for { let j := 0 } lt(j, step) { j := add(j, 1) } {
                             let idx := add(code, j)
                             // Store [nbBits(8), symbol(8), 0(16)]
-                            mstore(add(dt, add(4, shl(2, idx))), or(shl(16, sym), shl(24, w)))
+                            mstore(add(dt, add(32, shl(5, idx))), or(shl(16, sym), shl(24, w)))
                         }
                         code := add(code, step)
                     }
@@ -1428,7 +1428,7 @@ function hufBuildDTableFromWeights(dt, weights, numSyms) {
                     let idx := 0
                     idx, cons := bitRead(cont, cons, tableLog)
                     // Read entry: [nbBits(8), symbol(8), 0(16)]
-                    let entry := mload(add(dtable, add(4, shl(2, idx))))
+                    let entry := mload(add(dtable, add(32, shl(5, idx))))
                     let sym := and(shr(16, entry), 0xFF)
                     let nb := and(shr(24, entry), 0xFF)
                     // If nb > tableLog, consume extra bits and adjust index
@@ -1438,7 +1438,7 @@ function hufBuildDTableFromWeights(dt, weights, numSyms) {
                         more, cons := bitRead(cont, cons, extra)
                         // Adjust: idx = (idx >> (nb - tableLog)) | (more << (tableLog - (nb - tableLog)))
                         idx := add(shl(tableLog, more), shr(sub(nb, tableLog), idx))
-                        entry := mload(add(dtable, add(4, shl(2, idx))))
+                        entry := mload(add(dtable, add(32, shl(5, idx))))
                         sym := and(shr(16, entry), 0xFF)
                     }
                     // If nb < tableLog, put back unused bits
