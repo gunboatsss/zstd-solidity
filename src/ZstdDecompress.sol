@@ -663,7 +663,8 @@ library ZstdDecompress {
                 let pos := 0
                 for { let s := 0 } lt(s, msv1) { s := add(s, 1) } {
                     let n := and(mload(add(norm, shl(5, s))), 0xFFFF)
-                    if eq(n, 0xFFFF) { continue }
+                    if eq(n, 0xFFFF) { n := 1 }
+                    if iszero(n) { continue }
                     for { let i := 0 } lt(i, n) { i := add(i, 1) } {
                         mstore8(add(spread, pos), s)
                         pos := add(pos, 1)
@@ -671,7 +672,7 @@ library ZstdDecompress {
                 }
                 pos := 0
                 for { let u := 0 } lt(u, tsize) { u := add(u, 1) } {
-                    mstore(add(td, shl(5, u)), and(mload(add(spread, pos)), 0xFF))
+                    mstore(add(td, shl(5, u)), and(mload(add(spread, u)), 0xFF))
                     pos := and(add(pos, step), tmask)
                 }
                 let nc := add(wk, 0x5000)
@@ -1188,21 +1189,18 @@ library ZstdDecompress {
                 // Spread
                 for { let s := 0 } lt(s, msv1) { s := add(s, 1) } {
                     let n := and(mload(add(norm, shl(5, s))), 0xFFFF)
-                    if eq(n, 0xFFFF) { continue }
+                    if eq(n, 0xFFFF) { n := 1 }
+                    if iszero(n) { continue }
                     for { let i := 0 } lt(i, n) { i := add(i, 1) } {
                         mstore8(add(spread, pos), s)
                         pos := add(pos, 1)
                     }
                 }
-                // Distribute: place ALL spread entries (tsize total, including low-prob)
+                // Distribute: tsize iterations, NO skip
                 pos := 0
                 for { let u := 0 } lt(u, tsize) { u := add(u, 1) } {
                     mstore(add(td, shl(2, pos)), and(mload(add(spread, u)), 0xFF))
                     pos := and(add(pos, step), tmask)
-                    // Skip over low-prob area (positions > hith)
-                    for { } gt(pos, hith) { } {
-                        pos := and(add(pos, step), tmask)
-                    }
                 }
                 // Build entries
                 let nc := add(wk, 0x7000)
