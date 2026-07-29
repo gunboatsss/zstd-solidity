@@ -1156,8 +1156,248 @@ library ZstdDecompress {
             }
 
             // ================================================================
-            // MAIN DECOMPRESSOR
+            // HUFFMAN DECODER
             // ================================================================
+
+            // FSE build DTable for byte symbols (used for Huffman weights)
+            // Entry format: [newState(16), symbol(8), nbBits(8)] — 4 bytes each
+            function fseBuildDTableBytes(dt, norm, maxSV, tlog, wk) {
+                let tsize := shl(tlog, 1)
+                let msv1 := add(maxSV, 1)
+                let sn := add(wk, 0x6000)
+                let spread := add(sn, shl(5, msv1))
+                let hith := sub(tsize, 1)
+                // Init
+                for { let s := 0 } lt(s, msv1) { s := add(s, 1) } {
+                    let c := and(mload(add(norm, shl(5, s))), 0xFFFF)
+                    if eq(c, 0xFFFF) {
+                        mstore(add(dt, add(4, shl(2, hith))), s)
+                        mstore(add(sn, shl(5, s)), 1)
+                        hith := sub(hith, 1)
+                    }
+                    if iszero(eq(c, 0xFFFF)) {
+                        mstore(add(sn, shl(5, s)), c)
+                    }
+                }
+                // Header: tableLog in low 16 bits
+                mstore(dt, tlog)
+                let td := add(dt, 4)
+                let tmask := sub(tsize, 1)
+                let step := add(add(div(tsize, 2), div(tsize, 8)), 3)
+                let pos := 0
+                // Spread
+                for { let s := 0 } lt(s, msv1) { s := add(s, 1) } {
+                    let n := and(mload(add(norm, shl(5, s))), 0xFFFF)
+                    if eq(n, 0xFFFF) { continue }
+                    for { let i := 0 } lt(i, n) { i := add(i, 1) } {
+                        mstore8(add(spread, pos), s)
+                        pos := add(pos, 1)
+                    }
+                }
+                pos := 0
+                for { let u := 0 } lt(u, tsize) { u := add(u, 1) } {
+                    mstore(add(td, shl(2, u)), and(mload(add(spread, pos)), 0xFF))
+                    pos := and(add(pos, step), tmask)
+                }
+                // Build entries
+                let nc := add(wk, 0x7000)
+                for { let s := 0 } lt(s, msv1) { s := add(s, 1) } {
+                    mstore(add(nc, shl(5, s)), and(mload(add(sn, shl(5, s))), 0xFFFF))
+                }
+                for { let u := 0 } lt(u, tsize) { u := add(u, 1) } {
+                    let sym := and(mload(add(td, shl(2, u))), 0xFF)
+                    let nx := and(mload(add(nc, shl(5, sym))), 0xFFFF)
+                    mstore(add(nc, shl(5, sym)), add(nx, 1))
+                    let nb := sub(tlog, highbit32(nx))
+                    if iszero(nx) { nb := tlog }
+                    let nn := 0
+                    if nb { nn := sub(shl(nx, nb), tsize) }
+                    let entry := or(or(and(nn, 0xFFFF), shl(16, sym)), shl(24, nb))
+                    mstore(add(td, shl(2, u)), entry)
+                }
+            }
+
+            // FSE decode stream for bytes
+            function fseDecodeBytes(dst, maxDst, src, srcSize, dtable, tlog) -> written {
+                // Need at least 8 bytes for the bitstream
+                if lt(srcSize, 8) { written := dst
+                    leave }
+                let end := add(src, srcSize)
+                let cont := readLE64(sub(end, 8))
+                let cons := 0
+                let bp := sub(end, 8)
+                let bs := src
+                let bl := add(bs, 8)
+                let lb := read8(sub(end, 1))
+                if lb { cons := sub(8, highbit32(lb)) }
+
+                let state := 0
+                if tlog {
+                    state, cons := bitRead(cont, cons, tlog)
+                }
+
+                let op := dst
+                let oend := add(dst, maxDst)
+                for { } lt(op, oend) { } {
+                    if gt(cons, 56) {
+                        cont, cons, bp := bitReload(cont, cons, bp, bs, bl)
+                    }
+                    let entry := mload(add(dtable, add(4, shl(2, state))))
+                    let sym := and(shr(16, entry), 0xFF)
+                    let nb := and(shr(24, entry), 0xFF)
+                    let ns := and(entry, 0xFFFF)
+                    if nb {
+                        let lo := 0
+                        lo, cons := bitRead(cont, cons, nb)
+                        state := add(ns, lo)
+                    }
+                    if iszero(nb) { state := ns }
+                    mstore8(op, sym)
+                    op := add(op, 1)
+                }
+                written := sub(op, dst)
+            }
+
+            // Huffman decode: reads weights, builds table, decodes stream
+            function hufDecompress(dst, dstSize, src, srcSize) {
+                // Fill with zeros (placeholder until Huffman decode works)
+                for { let i := 0 } lt(i, dstSize) { i := add(i, 1) } {
+                    mstore8(add(dst, i), 0)
+                }
+            }
+
+function hufBuildDTableFromWeights(dt, weights, numSyms) {
+                // Rank stats
+                let rankStats := mload(0x40)
+                mstore(0x40, add(rankStats, 64))
+                for { let i := 0 } lt(i, 13) { i := add(i, 1) } {
+                    mstore(add(rankStats, shl(2, i)), 0)
+                }
+                let weightTotal := 0
+                for { let n := 0 } lt(n, numSyms) { n := add(n, 1) } {
+                    let w := and(mload(add(weights, n)), 0xFF)
+                    if gt(w, 12) { continue }
+                    if eq(w, 0) { continue }
+                    let cnt := mload(add(rankStats, shl(2, w)))
+                    mstore(add(rankStats, shl(2, w)), add(cnt, 1))
+                    weightTotal := add(weightTotal, shl(sub(w, 1), 1))
+                }
+                if iszero(weightTotal) { revert(0, 0) }
+
+                let tableLog := add(highbit32(weightTotal), 1)
+                if gt(tableLog, 12) { revert(0, 0) }
+                let total := shl(tableLog, 1)
+                let rest := sub(total, weightTotal)
+                let restHigh := highbit32(rest)
+                if iszero(eq(shl(restHigh, 1), rest)) { revert(0, 0) }
+                let lastWeight := add(restHigh, 1)
+                mstore8(add(weights, numSyms), lastWeight)
+                let lc := mload(add(rankStats, shl(2, lastWeight)))
+                mstore(add(rankStats, shl(2, lastWeight)), add(lc, 1))
+                numSyms := add(numSyms, 1)
+
+                // Build sorted symbols
+                let sorted := mload(0x40)
+                mstore(0x40, add(sorted, shl(5, numSyms)))
+                let pos := 0
+                for { let w := 1 } lt(w, 13) { w := add(w, 1) } {
+                    let cnt := mload(add(rankStats, shl(2, w)))
+                    if iszero(cnt) { continue }
+                    for { let i := 0 } lt(i, cnt) { i := add(i, 1) } {
+                        // Find symbol with this weight (linear search)
+                        for { let s := 0 } lt(s, numSyms) { s := add(s, 1) } {
+                            let sw := and(mload(add(weights, s)), 0xFF)
+                            if eq(sw, w) {
+                                mstore(add(sorted, shl(5, pos)), s)
+                                pos := add(pos, 1)
+                                // Mark as used
+                                mstore8(add(weights, s), 0xFF)
+                                break
+                            }
+                        }
+                    }
+                }
+
+                // Build canonical codes and decode table
+                let tableSize := shl(tableLog, 1)
+                let nextCode := 0
+                for { let w := 1 } lt(w, 13) { w := add(w, 1) } {
+                    let cnt := mload(add(rankStats, shl(2, w)))
+                    if iszero(cnt) { nextCode := shl(1, nextCode)
+                        continue }
+                    let code := nextCode
+                    for { let i := 0 } lt(i, cnt) { i := add(i, 1) } {
+                        let sym := mload(add(sorted, shl(5, add(sub(pos, cnt), i))))
+                        // Fill table entries
+                        let step := shl(sub(tableLog, w), 1)
+                        for { let j := 0 } lt(j, step) { j := add(j, 1) } {
+                            let idx := add(code, j)
+                            // Store [nbBits(8), symbol(8), 0(16)]
+                            mstore(add(dt, add(4, shl(2, idx))), or(shl(16, sym), shl(24, w)))
+                        }
+                        code := add(code, step)
+                    }
+                    nextCode := shl(1, add(code, cnt))
+                    nextCode := shr(1, nextCode)
+                }
+                mstore(dt, tableLog)
+            }
+
+            // Huffman bitstream decoder
+            function hufDecodeStream(dst, dstSize, src, srcSize, dtable) {
+                if lt(srcSize, 8) {
+                    // Not enough data — copy raw as fallback
+                    for { let i := 0 } lt(i, dstSize) { i := add(i, 1) } {
+                        mstore8(add(dst, i), read8(add(src, i)))
+                    }
+                    leave
+                }
+                let tableLog := and(mload(dtable), 0xFF)
+                let tableSize := shl(tableLog, 1)
+                let tableMask := sub(tableSize, 1)
+
+                // Init bitstream
+                let end := add(src, srcSize)
+                let cont := readLE64(sub(end, 8))
+                let cons := 0
+                let bp := sub(end, 8)
+                let bs := src
+                let bl := add(bs, 8)
+                let lb := read8(sub(end, 1))
+                if lb { cons := sub(8, highbit32(lb)) }
+
+                let op := dst
+                let oend := add(dst, dstSize)
+                for { } lt(op, oend) { } {
+                    if gt(cons, 56) {
+                        cont, cons, bp := bitReload(cont, cons, bp, bs, bl)
+                    }
+                    // Read tableLog bits for lookup
+                    let idx := 0
+                    idx, cons := bitRead(cont, cons, tableLog)
+                    // Read entry: [nbBits(8), symbol(8), 0(16)]
+                    let entry := mload(add(dtable, add(4, shl(2, idx))))
+                    let sym := and(shr(16, entry), 0xFF)
+                    let nb := and(shr(24, entry), 0xFF)
+                    // If nb > tableLog, consume extra bits and adjust index
+                    if gt(nb, tableLog) {
+                        let extra := sub(nb, tableLog)
+                        let more := 0
+                        more, cons := bitRead(cont, cons, extra)
+                        // Adjust: idx = (idx >> (nb - tableLog)) | (more << (tableLog - (nb - tableLog)))
+                        idx := add(shl(tableLog, more), shr(sub(nb, tableLog), idx))
+                        entry := mload(add(dtable, add(4, shl(2, idx))))
+                        sym := and(shr(16, entry), 0xFF)
+                    }
+                    // If nb < tableLog, put back unused bits
+                    if lt(nb, tableLog) {
+                        cons := sub(cons, sub(tableLog, nb))
+                    }
+                    mstore8(op, sym)
+                    op := add(op, 1)
+                }
+            }
+
             function zstdDecompress(srcPtr, srcLen) -> resultPtr {
                 if lt(srcLen, 5) { revert(0, 0) }
                 let srcEnd := add(srcPtr, srcLen)
@@ -1311,34 +1551,10 @@ library ZstdDecompress {
                                 mstore8(add(litPtr, i), rB)
                             }
                         }
-                        // Compressed/Repeat literals (Huffman — placeholder passthrough)
+                        // Compressed/Repeat literals
+                        // Huffman-compressed literals: not yet supported, revert cleanly
                         if or(eq(litEnc, 2), eq(litEnc, 3)) {
-                            let lhc := readLE32(blkPtr)
-                            if eq(litCode, 0) {
-                                lhSize := 3
-                                litSize := and(shr(4, lhc), 0x3FF)
-                                litCSize := and(shr(14, lhc), 0x3FF)
-                            }
-                            if eq(litCode, 1) {
-                                lhSize := 3
-                                litSize := and(shr(4, lhc), 0x3FF)
-                                litCSize := and(shr(14, lhc), 0x3FF)
-                            }
-                            if eq(litCode, 2) {
-                                lhSize := 4
-                                litSize := and(shr(4, lhc), 0x3FFF)
-                                litCSize := shr(18, lhc)
-                            }
-                            if eq(litCode, 3) {
-                                lhSize := 5
-                                litSize := and(shr(4, lhc), 0x3FFFF)
-                                litCSize := add(shr(22, lhc), shl(10, read8(add(blkPtr, 4))))
-                            }
-                            litRead := add(lhSize, litCSize)
-                            litPtr := mload(0x40)
-                            mstore(0x40, add(litPtr, add(litSize, 0x200)))
-                            // Passthrough (raw copy — full Huffman decode needed)
-                            memcpy(litPtr, add(blkPtr, lhSize), litSize)
+                            revert(0, 0)
                         }
 
                         blkPtr := add(blkPtr, litRead)
