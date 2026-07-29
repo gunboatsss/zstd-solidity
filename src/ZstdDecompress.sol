@@ -1305,7 +1305,7 @@ library ZstdDecompress {
                     let wEnd := fseDecodeBytes(weights, 254, newSrc, newSize, wTable, tlog)
                     numSyms := sub(wEnd, weights)
                     if gt(numSyms, 256) { numSyms := 256 }
-                    hdrBytesConsumed := add(1, sub(fseSize, newSize))
+                    hdrBytesConsumed := add(1, hdrSize)
                 }
 
                 let hufTable := mload(0x40)
