@@ -1194,10 +1194,15 @@ library ZstdDecompress {
                         pos := add(pos, 1)
                     }
                 }
+                // Distribute: place ALL spread entries (tsize total, including low-prob)
                 pos := 0
                 for { let u := 0 } lt(u, tsize) { u := add(u, 1) } {
-                    mstore(add(td, shl(2, u)), and(mload(add(spread, pos)), 0xFF))
+                    mstore(add(td, shl(2, pos)), and(mload(add(spread, u)), 0xFF))
                     pos := and(add(pos, step), tmask)
+                    // Skip over low-prob area (positions > hith)
+                    for { } gt(pos, hith) { } {
+                        pos := and(add(pos, step), tmask)
+                    }
                 }
                 // Build entries
                 let nc := add(wk, 0x7000)
@@ -1220,6 +1225,7 @@ library ZstdDecompress {
             // FSE decode stream for bytes
             function fseDecodeBytes(dst, maxDst, src, srcSize, dtable, tlog) -> written {
                 // Need at least 8 bytes for the bitstream
+                if lt(srcSize, 1) { revert(0, 0) }
                 if lt(srcSize, 8) { written := dst
                     leave }
                 let end := add(src, srcSize)
@@ -1260,10 +1266,55 @@ library ZstdDecompress {
 
             // Huffman decode: reads weights, builds table, decodes stream
             function hufDecompress(dst, dstSize, src, srcSize) {
-                // Fill with zeros (placeholder until Huffman decode works)
-                for { let i := 0 } lt(i, dstSize) { i := add(i, 1) } {
-                    mstore8(add(dst, i), 0)
+                if iszero(srcSize) { revert(0, 0) }
+                let hdrSize := read8(src)
+                let weights := mload(0x40)
+                mstore(0x40, add(weights, 256))
+                let numSyms := 0
+                let hdrBytesConsumed := 0
+
+                if iszero(lt(hdrSize, 128)) {
+                    numSyms := sub(hdrSize, 127)
+                    if gt(numSyms, 256) { revert(0, 0) }
+                    let wSrc := add(src, 1)
+                    for { let i := 0 } lt(i, numSyms) { i := add(i, 2) } {
+                        let b := read8(wSrc)
+                        wSrc := add(wSrc, 1)
+                        mstore8(add(weights, i), and(shr(4, b), 0xF))
+                        if lt(add(i, 1), numSyms) {
+                            mstore8(add(weights, add(i, 1)), and(b, 0xF))
+                        }
+                    }
+                    hdrBytesConsumed := add(1, div(add(numSyms, 1), 2))
                 }
+                if lt(hdrSize, 128) {
+                    let fseSrc := add(src, 1)
+                    let fseSize := sub(srcSize, 1)
+                    let norm := mload(0x40)
+                    mstore(0x40, add(norm, 8192))
+                    let br := 0
+                    let tlog := 0
+                    let mo := 0
+                    br, tlog, mo := fseReadNCount(norm, 255, fseSrc, add(fseSrc, fseSize))
+                    if gt(tlog, 6) { revert(0, 0) }
+                    let newSrc := add(fseSrc, br)
+                    let newSize := sub(fseSize, br)
+                    let wTable := mload(0x40)
+                    mstore(0x40, add(wTable, add(shl(tlog, 2), 4)))
+                    fseBuildDTableBytes(wTable, norm, mo, tlog, mload(0x40))
+                    let wEnd := fseDecodeBytes(weights, 254, newSrc, newSize, wTable, tlog)
+                    numSyms := sub(wEnd, weights)
+                    if gt(numSyms, 256) { numSyms := 256 }
+                    hdrBytesConsumed := add(1, sub(fseSize, newSize))
+                }
+
+                let hufTable := mload(0x40)
+                mstore(0x40, add(hufTable, 4096))
+                hufBuildDTableFromWeights(hufTable, weights, numSyms)
+
+                let litSrc := add(src, hdrBytesConsumed)
+                let litSrcSize := sub(srcSize, hdrBytesConsumed)
+                hufDecodeStream(dst, dstSize, litSrc, litSrcSize, hufTable)
             }
 
 function hufBuildDTableFromWeights(dt, weights, numSyms) {
@@ -1345,6 +1396,7 @@ function hufBuildDTableFromWeights(dt, weights, numSyms) {
 
             // Huffman bitstream decoder
             function hufDecodeStream(dst, dstSize, src, srcSize, dtable) {
+                if lt(srcSize, 1) { revert(0, 0) }
                 if lt(srcSize, 8) {
                     // Not enough data — copy raw as fallback
                     for { let i := 0 } lt(i, dstSize) { i := add(i, 1) } {
@@ -1552,9 +1604,33 @@ function hufBuildDTableFromWeights(dt, weights, numSyms) {
                             }
                         }
                         // Compressed/Repeat literals
-                        // Huffman-compressed literals: not yet supported, revert cleanly
                         if or(eq(litEnc, 2), eq(litEnc, 3)) {
-                            revert(0, 0)
+                            let lhc := readLE32(blkPtr)
+                            if eq(litCode, 0) {
+                                lhSize := 3
+                                litSize := and(shr(4, lhc), 0x3FF)
+                                litCSize := and(shr(14, lhc), 0x3FF)
+                            }
+                            if eq(litCode, 1) {
+                                lhSize := 3
+                                litSize := and(shr(4, lhc), 0x3FF)
+                                litCSize := and(shr(14, lhc), 0x3FF)
+                            }
+                            if eq(litCode, 2) {
+                                lhSize := 4
+                                litSize := and(shr(4, lhc), 0x3FFF)
+                                litCSize := shr(18, lhc)
+                            }
+                            if eq(litCode, 3) {
+                                lhSize := 5
+                                litSize := and(shr(4, lhc), 0x3FFFF)
+                                litCSize := add(shr(22, lhc), shl(10, read8(add(blkPtr, 4))))
+                            }
+                            litRead := add(lhSize, litCSize)
+                            litPtr := mload(0x40)
+                            mstore(0x40, add(litPtr, add(litSize, 0x200)))
+                            let huffSrc := add(blkPtr, lhSize)
+                            hufDecompress(litPtr, litSize, huffSrc, litCSize)
                         }
 
                         blkPtr := add(blkPtr, litRead)
